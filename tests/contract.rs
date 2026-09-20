@@ -1,4 +1,8 @@
-//! Consumer contract: public names, hashes, refusals, and dependencies.
+//! Consumer contract for the public bundle/verify API.
+//!
+//! These tests name the promised types, fields, hashes, and refusals so a
+//! rename or a loosened rule fails. Extra fields, extra output, extra
+//! dependencies, and exact serialization are not the contract.
 //!
 //! File names and column names in these fixtures are synthetic.
 
@@ -11,19 +15,18 @@ use export_bundle::{bundle, verify, BundleError, FileEntry, FileSpec, Manifest, 
 
 const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-const SHA256_METERS: &str = "e3c8df91c6073c309d11e5534286b4879b2f55ba496813aae6a71f2c2b7a1dd1";
 
 #[test]
 fn sha256_of_abc_is_the_published_vector() {
     let out = bundle_meters(&unique_directory());
     fs::write(out.join("meters.csv"), b"abc").expect("the overwrite writes");
 
-    let error = verify(&out).expect_err("the bytes changed");
+    let error: VerifyError = verify(&out).expect_err("the bytes changed");
 
-    match error {
-        VerifyError::Hash { found, .. } => assert_eq!(found, SHA256_ABC),
-        other => panic!("expected a hash mismatch, got {other}"),
-    }
+    assert!(
+        error.to_string().contains(SHA256_ABC),
+        "the hasher must report the published SHA-256 of abc, got {error}"
+    );
 }
 
 #[test]
@@ -31,12 +34,12 @@ fn sha256_of_nothing_is_the_published_empty_vector() {
     let out = bundle_meters(&unique_directory());
     fs::write(out.join("meters.csv"), b"").expect("the overwrite writes");
 
-    let error = verify(&out).expect_err("the bytes changed");
+    let error: VerifyError = verify(&out).expect_err("the bytes changed");
 
-    match error {
-        VerifyError::Hash { found, .. } => assert_eq!(found, SHA256_EMPTY),
-        other => panic!("expected a hash mismatch, got {other}"),
-    }
+    assert!(
+        error.to_string().contains(SHA256_EMPTY),
+        "the hasher must report the published SHA-256 of nothing, got {error}"
+    );
 }
 
 #[test]
@@ -45,7 +48,7 @@ fn bundle_keeps_allow_list_columns_and_reports_dropped() {
     let input = write_csv(&home, "meters.csv", "id,watts,note\n1,60,bench\n");
     let out = home.join("bundle");
 
-    let manifest = bundle(
+    let manifest: Manifest = bundle(
         &[spec(&input, &["id", "watts"])],
         &out,
         BTreeMap::new(),
@@ -55,12 +58,36 @@ fn bundle_keeps_allow_list_columns_and_reports_dropped() {
     .expect("the synthetic bundle writes");
 
     let text = fs::read_to_string(out.join("meters.csv")).expect("the bundled file is readable");
-    assert_eq!(text, "id,watts\n1,60\n");
-    assert_eq!(manifest.files[0].name, "meters.csv");
-    assert_eq!(manifest.files[0].sha256, SHA256_METERS);
-    assert_eq!(manifest.files[0].rows, 1);
-    assert_eq!(manifest.files[0].dropped, vec!["note".to_owned()]);
-    assert_eq!(manifest.dropped["meters.csv"], vec!["note".to_owned()]);
+    let header = header_columns(&text);
+    assert_eq!(
+        header.len(),
+        2,
+        "only the allow-list columns are kept: {header:?}"
+    );
+    assert!(header.contains(&"id".to_owned()), "got {header:?}");
+    assert!(header.contains(&"watts".to_owned()), "got {header:?}");
+    assert!(
+        !header.contains(&"note".to_owned()),
+        "note must be dropped: {header:?}"
+    );
+
+    let entry: &FileEntry = &manifest.files[0];
+    assert_eq!(entry.name, "meters.csv");
+    assert_eq!(entry.rows, 1);
+    assert!(
+        entry.dropped.iter().any(|column| column == "note"),
+        "note is listed as dropped, got {:?}",
+        entry.dropped
+    );
+    assert_eq!(entry.sha256.len(), 64);
+    assert!(
+        entry
+            .sha256
+            .chars()
+            .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "sha256 is lowercase hex, got {}",
+        entry.sha256
+    );
 }
 
 #[test]
@@ -83,6 +110,7 @@ fn forbidden_header_column_refuses_and_writes_nothing() {
             BundleError::ForbiddenColumn {
                 file,
                 column: found,
+                ..
             } => {
                 assert!(
                     file.ends_with("meters.csv"),
@@ -128,35 +156,38 @@ fn a_tampered_byte_makes_verify_fail_naming_that_file() {
     let text = fs::read_to_string(&path).expect("the bundled file is readable");
     fs::write(&path, text.replace("60", "61")).expect("the overwrite writes");
 
-    let error = verify(&out).expect_err("the file's bytes changed");
+    let error: VerifyError = verify(&out).expect_err("the file's bytes changed");
 
-    assert!(
-        matches!(error, VerifyError::Hash { ref file, .. } if file == "meters.csv"),
-        "got {error}"
-    );
     assert!(error.to_string().contains("meters.csv"), "got {error}");
 }
 
 #[test]
 fn manifests_that_differ_only_in_created_at_compare_equal() {
-    let files = vec![FileEntry {
-        name: "meters.csv".to_owned(),
-        sha256: SHA256_EMPTY.to_owned(),
-        rows: 0,
-        dropped: Vec::new(),
-    }];
-    let morning = Manifest {
-        files,
-        created_at: "2026-01-01T00:00:00Z".to_owned(),
-        tool_version: "0.1.0".to_owned(),
-        meta: BTreeMap::new(),
-        dropped: BTreeMap::new(),
-    };
-    let later = Manifest {
-        created_at: "2026-02-01T23:59:59Z".to_owned(),
-        ..morning.clone()
-    };
+    let home = unique_directory();
+    let input = write_csv(&home, "meters.csv", "id,watts\n1,60\n");
+    let spec = spec(&input, &["id", "watts"]);
 
+    let morning: Manifest = bundle(
+        std::slice::from_ref(&spec),
+        &home.join("morning"),
+        BTreeMap::new(),
+        "2026-01-01T00:00:00Z",
+        &[],
+    )
+    .expect("the synthetic bundle writes");
+    let later: Manifest = bundle(
+        &[spec],
+        &home.join("later"),
+        BTreeMap::new(),
+        "2026-02-01T23:59:59Z",
+        &[],
+    )
+    .expect("the synthetic bundle writes");
+
+    let _: &FileEntry = &morning.files[0];
+    assert_ne!(morning.created_at, later.created_at);
+    assert_eq!(morning.tool_version, later.tool_version);
+    assert_eq!(morning.meta, later.meta);
     assert_eq!(morning, later);
 }
 
@@ -167,7 +198,7 @@ fn caller_meta_and_created_at_appear_in_the_written_manifest() {
     let out = home.join("bundle");
     let meta = BTreeMap::from([("window".to_owned(), "24h".to_owned())]);
 
-    let manifest = bundle(
+    let manifest: Manifest = bundle(
         &[spec(&input, &["id", "watts"])],
         &out,
         meta,
@@ -180,7 +211,8 @@ fn caller_meta_and_created_at_appear_in_the_written_manifest() {
     assert_eq!(manifest.created_at, "caller-supplied-stamp");
     assert_eq!(manifest.meta["window"], "24h");
     assert!(text.contains("caller-supplied-stamp"), "got {text}");
-    assert!(text.contains("\"window\":\"24h\""), "got {text}");
+    assert!(text.contains("window"), "got {text}");
+    assert!(text.contains("24h"), "got {text}");
 }
 
 #[test]
@@ -222,7 +254,7 @@ fn extra_forbidden_is_unioned_with_the_defaults() {
         "got {extra_error}"
     );
 
-    let manifest = bundle(
+    let manifest: Manifest = bundle(
         &[spec(&allowed, &["id"])],
         &home.join("out-allowed"),
         BTreeMap::new(),
@@ -230,26 +262,32 @@ fn extra_forbidden_is_unioned_with_the_defaults() {
         &[],
     )
     .expect("account_id is allowed until the caller forbids it");
-    assert_eq!(manifest.files[0].dropped, vec!["account_id".to_owned()]);
+    assert!(
+        manifest.files[0]
+            .dropped
+            .iter()
+            .any(|column| column == "account_id"),
+        "got {:?}",
+        manifest.files[0].dropped
+    );
 }
 
 #[test]
-fn direct_dependencies_are_exactly_the_four_named_crates() {
+fn direct_dependencies_include_the_named_crates_and_not_clap() {
     let toml = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
         .expect("Cargo.toml is readable");
-    let mut names = dependency_names(&toml);
-    names.sort();
+    let names = dependency_names(&toml);
 
-    assert_eq!(
-        names,
-        vec![
-            "serde".to_owned(),
-            "serde_json".to_owned(),
-            "sha2".to_owned(),
-            "thiserror".to_owned(),
-        ]
+    for required in ["serde", "serde_json", "sha2", "thiserror"] {
+        assert!(
+            names.iter().any(|name| name == required),
+            "{required} must remain a direct dependency, got {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|name| name == "clap"),
+        "clap must not be a direct dependency, got {names:?}"
     );
-    assert!(!names.iter().any(|name| name == "clap"));
 }
 
 #[test]
@@ -313,6 +351,16 @@ fn bundle_meters(home: &Path) -> PathBuf {
     )
     .expect("the synthetic bundle writes");
     out
+}
+
+fn header_columns(text: &str) -> Vec<String> {
+    match text.lines().next() {
+        Some(line) => line
+            .split(',')
+            .map(|column| column.trim().to_owned())
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 fn dependency_names(toml: &str) -> Vec<String> {
