@@ -1,39 +1,77 @@
-# crate-template
+# export-bundle
 
-Starting files for a public Rust library. REPLACE the crate name in this heading, in `Cargo.toml`, and in the install lines below.
+Copy CSV files while keeping only the columns a caller allows, refuse any
+header that names a person or a machine, and write a manifest the recipient
+can check later.
 
 ## What this is
 
-REPLACE: one sentence that says what this crate does.
+A small Rust library and command-line tool that makes a *bundle*: a directory
+of CSV files, each rewritten to only its allowed columns, beside a
+`manifest.json` that records a SHA-256 hash and a row count for every file.
+A second command re-checks a bundle against its manifest.
 
 ## Who it is for
 
-REPLACE: one sentence that names the reader this crate is written for.
+Anyone who has to hand CSV files to a third party and wants a provable record
+of exactly which bytes left — and a tool that refuses to copy identifying
+columns rather than asking it to judge them.
 
 ## How to use it
 
 Add the crate to a Rust project:
 
 ```sh
-cargo add crate-template
+cargo add export-bundle
 ```
 
 That writes this line into `Cargo.toml`:
 
 ```toml
-crate-template = "0.1.0"
+export-bundle = "0.1.0"
 ```
 
-Minimal example:
+Minimal example. The file names and column names below are synthetic.
 
 ```rust
-fn main() {
-    // Synthetic example. Replace this body with a call into this crate.
-}
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use export_bundle::{bundle, FileSpec};
+
+let spec = FileSpec {
+    path: Path::new("examples/usage/meters.csv").to_owned(),
+    keep_columns: vec!["id".to_owned(), "watts".to_owned()],
+};
+let meta = BTreeMap::from([("window".to_owned(), "24h".to_owned())]);
+let manifest = bundle(&[spec], Path::new("examples/usage/out"), meta, "2026-01-01T00:00:00Z", &[])
+    .expect("the bundle writes");
+export_bundle::verify(Path::new("examples/usage/out")).expect("the bundle verifies");
+let _ = manifest;
+```
+
+A bundle is a copy of the listed files with every column not on the
+allow-list dropped, so the manifest is what lets a recipient prove, later and
+without your help, that the bundle is unchanged. Because `manifest.json`
+carries a SHA-256 of every file, "this bundle is unchanged" becomes a
+calculation anyone can run: re-hash each file, compare against the manifest,
+and either every byte matches what you exported or a specific file and hash
+is named as different. Nothing has to be trusted on either side — no
+attestation, no signature infrastructure, just the hashes and the files
+themselves.
+
+The command-line tool does the same without writing Rust:
+
+```sh
+export-bundle bundle --out bundle-dir --keep id,watts meters.csv
+export-bundle verify bundle-dir
 ```
 
 ## What it deliberately does not do
 
-REPLACE: one sentence that names the things this crate refuses to do.
+It does not encrypt, does not transmit, does not anonymise values inside a
+column (it drops columns; it does not rewrite them), and does not decide
+which columns are safe — allow-lists are supplied by the caller, because only
+the caller knows their data.
 
 Version 0.x: the API may change before 1.0.
